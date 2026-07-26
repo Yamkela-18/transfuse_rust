@@ -1,0 +1,10 @@
+/target
+.idea/
+trinity_out/
+*.salmon_quant/
+*.namesorted.bam
+*.bam
+*.bai
+*_filtered.fa
+*_cons.fa
+*_scores.csv

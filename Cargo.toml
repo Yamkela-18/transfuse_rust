@@ -1,0 +1,42 @@
+[package]
+name        = "transfuse"
+version     = "0.1.0"
+edition     = "2021"
+authors     = ["Rust port of cboursnell/transfuse"]
+description = "Merge multiple de novo transcriptome assemblies into a single high-quality FASTA"
+license     = "MIT"
+readme      = "README.md"
+repository  = "https://github.com/cboursnell/transfuse"
+
+[[bin]]
+name = "transfuse"
+path = "src/main.rs"
+
+[dependencies]
+# CLI argument parsing  (replaces Ruby's trollop gem)
+clap = { version = "4", features = ["derive", "color", "wrap_help"] }
+
+# Error handling
+anyhow    = "1"
+thiserror = "1"
+
+# Logging / progress  (replaces colorize)
+log        = "0.4"
+env_logger = "0.11"
+indicatif  = "0.17"
+colored    = "2"
+
+# CSV parsing  (replaces manual CSV parsing of Transrate output)
+csv   = "1"
+serde = { version = "1", features = ["derive"] }
+
+# Parallel iteration  (replaces Ruby's threach / threads)
+rayon = "1"
+
+# Temp files and path helpers
+tempfile = "3"
+
+[dev-dependencies]
+tempfile   = "3"
+assert_cmd = "2"
+predicates = "3"
