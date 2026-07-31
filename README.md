@@ -46,18 +46,14 @@ Score every contig across both assemblies and write `new_scores.csv`
 without building a merged output yet:
 
 ```bash
-cargo run -- --assemblies test_data/trinity_output.fasta,test_data/rnaspades_output.fasta \
-             --left test_data/reads.left.fq.gz --right test_data/reads.right.fq.gz \
-             --output new.csv --score-only
+cargo run -- --assemblies trinity_output.fasta,rnaspades_output.fasta --left reads.left.fq.gz --right reads.right.fq.gz --output new.csv --score-only
 ```
 
 Run the full pipeline end-to-end and write the merged, clustered,
 consensus-built assembly:
 
 ```bash
-cargo run -- --assemblies test_data/trinity_output.fasta,test_data/rnaspades_output.fasta \
-             --left test_data/reads.left.fq.gz --right test_data/reads.right.fq.gz \
-             --output new.fasta
+cargo run -- --assemblies trinity_output.fasta,rnaspades_output.fasta --left reads.left.fq.gz --right reads.right.fq.gz --output new.fasta
 ```
 
 Both `--left`/`--right` accept gzipped FASTQ (`.fq.gz`) directly — handled
@@ -81,13 +77,9 @@ A typical two-pass workflow, so re-runs with a different `--min-score` don't
 re-score from scratch:
 
 ```bash
-cargo run -- --assemblies test_data/trinity_output.fasta,test_data/rnaspades_output.fasta \
-             --left test_data/reads.left.fq.gz --right test_data/reads.right.fq.gz \
-             --output new.fasta --score-only
+cargo run -- --assemblies trinity_output.fasta,rnaspades_output.fasta --left reads.left.fq.gz --right reads.right.fq.gz --output new.fasta --score-only
 
-cargo run -- --assemblies test_data/trinity_output.fasta,test_data/rnaspades_output.fasta \
-             --left test_data/reads.left.fq.gz --right test_data/reads.right.fq.gz \
-             --output new.fasta --scores new_scores.csv --min-score 0.05
+cargo run -- --assemblies trinity_output.fasta,rnaspades_output.fasta --left reads.left.fq.gz --right reads.right.fq.gz --output new.fasta --scores new_scores.csv --min-score 0.05
 ```
 
 ## Scoring methodology
@@ -179,16 +171,3 @@ approximation, not a guaranteed numerical match.
 ```bash
 cargo test
 ```
-
-Unit tests cover CIGAR parsing, the mpileup identity parser, fragment-size
-estimation and pair-concordance logic, the Chow-test homogeneity check, and
-the CSV round-trip.
-
-## Credits
-
-Reimplements the pipeline design of
-[Transfuse](https://github.com/cboursnell/transfuse) (Chris Boursnell) and
-the contig-scoring approach of
-[TransRate](https://hibberdlab.com/transrate/) (Smith-Unna et al., *Genome
-Research*, 2016). If you use this in published work, cite the original
-TransRate paper and the Transfuse tool.
