@@ -1,10 +1,8 @@
 # Transfuse (Rust)
 
 A Rust reimplementation of [Transfuse](https://github.com/cboursnell/transfuse) —
-a tool that merges multiple *de novo* transcriptome assemblies (different
-assemblers, different k-mers) into one evidence-scored, non-redundant
-transcriptome, using [TransRate](https://hibberdlab.com/transrate/)-style
-reference-free contig scoring.
+a tool that merges multiple *de novo* transcriptome assemblies into one evidence-scored, non-redundant
+transcriptome.
 
 If you assembled the same RNA-seq data with several assemblers or parameter
 sets and don't want to just pick one and throw the rest away, this is the
