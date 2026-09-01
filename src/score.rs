@@ -15,7 +15,7 @@
 //            expected orientation and insert size, tested against the
 //            library's own empirical fragment-size distribution rather
 //            than trusting the aligner's "properly paired" flag
-//   sCseg  - coverage homogeneity: a Chow-test comparison of a one-segment
+//   sCseg  - coverage homogeneity: a Chow test comparing a one-segment
 //            vs. best two-segment fit to the windowed depth profile, to
 //            catch a jump between two plateaus (the signature of a
 //            chimera - two transcripts, expressed at different levels,
@@ -29,9 +29,22 @@
 // p_bases_covered, coverage - rather than persisting every intermediate
 // component. p_good is TransRate's own per-fragment pass-rate metric (see
 // pair_concordance_score below), not a copy of `score`.
+//
+// score_assemblies is, per-assembly, the most expensive step in the whole
+// pipeline - alignment, four samtools passes, and a Salmon quantification
+// run all happen inside run_alignment_coverage for every input assembly.
+// Its progress bar is sized to PHASES_PER_ASSEMBLY * assembly_files.len(),
+// not just assembly_files.len(), and ticks once per real sub-step
+// (alignment, each of bam.rs's four passes, Salmon) rather than only once
+// per whole assembly finishing - a single assembly can take minutes, and
+// without per-phase ticks the bar would sit frozen at one percentage for
+// that entire stretch despite real work happening underneath it. The bar
+// shows percentage only (no N/M fraction) - this is the only progress bar
+// in the program; main.rs has no separate overall pipeline bar.
 
 use anyhow::{bail, Result};
 use csv::{ReaderBuilder, WriterBuilder};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use log::info;
 use rayon::prelude::*;
 use serde::Deserialize;
@@ -45,19 +58,20 @@ use crate::aligner;
 use crate::bam;
 use crate::quant;
 
+/// Sub-steps ticked per assembly: aligning reads, bam.rs's four passes
+/// (bam::PHASES), and Salmon quantification.
+const PHASES_PER_ASSEMBLY: u64 = 1 + bam::PHASES + 1;
+
 #[derive(Debug, Clone, Default)]
 pub struct ContigScore {
     pub score: f64,           // final TransRate-style contig score (product of 4 terms)
     pub p_good: f64,          // TransRate's own metric: fraction of individual fragments
-    // (read pairs) mapped to this contig classified "good" -
-    // one of the 4 multiplicative factors in `score`, computed
-    // here via pair_concordance_score (see caveat there on how
-    // this approximates the original's per-fragment classifier)
+                              // (read pairs) mapped to this contig classified "good" -
+                              // one of the 4 multiplicative factors in `score`, computed
+                              // here via pair_concordance_score (see caveat there on how
+                              // this approximates the original's per-fragment classifier)
     pub p_bases_covered: f64, // sCcov: fraction of contig length with read coverage
-    pub coverage: f64,        // Salmon effective-length-normalized coverage estimate
-    // (eff_count * read_length / eff_len) - matches the
-    // original Ruby tool's `coverage` field; not part of
-    // the score itself, diagnostic only.
+    pub coverage: f64,        // mean depth (diagnostic only, not part of the score)
 }
 
 pub type ScoreMap = HashMap<String, ContigScore>;
@@ -83,6 +97,7 @@ pub fn score_assemblies(
     threads: usize,
     verbose: bool,
     prefix_keys: bool,
+    multi: &MultiProgress,
 ) -> Result<ScoreMap> {
     if assembly_files.is_empty() {
         bail!("No assemblies supplied");
@@ -96,13 +111,41 @@ pub fn score_assemblies(
         asm_threads
     );
 
+    // Thread-safe (ProgressBar is Send+Sync by design) - shared by
+    // reference across the rayon closure below. Sized to the number of
+    // real sub-steps across all assemblies, not just the assembly count,
+    // and ticked once per sub-step (see PHASES_PER_ASSEMBLY) so the
+    // percentage advances continuously rather than jumping only when an
+    // entire assembly finishes. Percentage only in the template - no
+    // N/M fraction.
+    let pb = multi.add(ProgressBar::new(
+        assembly_files.len() as u64 * PHASES_PER_ASSEMBLY,
+    ));
+    pb.set_style(
+        ProgressStyle::with_template(
+            "  scoring [{bar:30.green/white}] ({percent}%) {msg}",
+        )
+        .unwrap()
+        .progress_chars("=>-"),
+    );
+
     let results: Vec<Result<ScoreMap>> = assembly_files
         .par_iter()
         .enumerate()
         .map(|(idx, assembly)| {
             let contig_prefix = format!("contig{idx}");
+            let assembly_name = assembly
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| assembly.display().to_string());
 
-            let scored = run_alignment_coverage(assembly, left, right, asm_threads, verbose)?;
+            let mut on_phase = |phase: &str| {
+                pb.set_message(format!("{assembly_name}: {phase}"));
+                pb.inc(1);
+            };
+
+            let scored =
+                run_alignment_coverage(assembly, left, right, asm_threads, verbose, &mut on_phase)?;
 
             let mut out = ScoreMap::new();
             for (id, s) in scored {
@@ -116,6 +159,9 @@ pub fn score_assemblies(
             Ok(out)
         })
         .collect();
+
+    pb.finish_and_clear();
+    multi.remove(&pb);
 
     let mut combined = ScoreMap::new();
     for r in results {
@@ -134,15 +180,18 @@ fn run_alignment_coverage(
     right: &Path,
     threads: usize,
     verbose: bool,
+    on_phase: &mut dyn FnMut(&str),
 ) -> Result<HashMap<String, ContigScore>> {
+    on_phase("aligning reads");
     let bam_path = aligner::align_reads(fasta, left, right, threads, verbose)?;
 
-    // bam::compute_coverage runs samtools coverage + a fragment-size
-    // sampling pass + a full alignment-detail pass + an mpileup pass, and
-    // returns everything sCnuc/sCcov/sCord/sCseg need. It needs `fasta` too
-    // (mpileup requires the reference it's piling up against).
-    let stats = bam::compute_coverage(&bam_path, fasta)?;
+    // bam::compute_coverage calls on_phase itself, once per its own four
+    // passes (samtools coverage, fragment-size sampling, pair concordance,
+    // mpileup) - see bam.rs's PHASES constant, which PHASES_PER_ASSEMBLY
+    // above stays in sync with.
+    let stats = bam::compute_coverage(&bam_path, fasta, on_phase)?;
 
+    on_phase("salmon quantification");
     // Ruby's `coverage` column is Salmon's effective-length-normalized
     // estimate (eff_count * read_length / eff_len), not raw samtools depth -
     // these measure genuinely different things, so it's computed

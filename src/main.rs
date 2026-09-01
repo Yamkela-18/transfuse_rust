@@ -12,11 +12,30 @@
 //   6. Cluster with vsearch --cluster_fast
 //   7. Score-guided consensus selection
 //   8. Final scoring pass -> write output FASTA
+//
+// Progress: one overall pipeline bar here (percentage only, no N/M
+// fraction - matching score.rs's scoring bar and consensus.rs's merging
+// bar), plus the per-assembly scoring bar and the per-cluster merging bar
+// rendered by those two modules respectively. All three are registered
+// against the same MultiProgress created below, so they redraw correctly
+// alongside each other rather than fighting over the same terminal lines.
+//
+// `log::info!`/`debug!`/`warn!` output from every module is routed
+// through that same MultiProgress via a custom env_logger target
+// (ProgressAwareWriter), so a log line firing while any bar is active
+// properly suspends/redraws it instead of corrupting it.
+//
+// Subprocess noise (Salmon's and samtools mpileup's own internal logging,
+// which writes directly to inherited stderr and is invisible to any of
+// the above, since it never goes through Rust's `log` crate at all) is
+// suppressed at the source in quant.rs/bam.rs.
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use colored::Colorize;
+use indicatif::MultiProgress;
 use log::info;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
 mod aligner;
@@ -26,8 +45,8 @@ mod consensus;
 mod deps;
 mod fasta;
 mod filter;
-mod score;
 mod quant;
+mod score;
 
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -102,14 +121,50 @@ fn main() {
     }
 }
 
+/// A `Write` target for env_logger that pipes every write through
+/// `MultiProgress::suspend`, so a log line printed from ANYWHERE in the
+/// program (any module, any call depth) properly hides all active
+/// progress bars, prints cleanly, then lets them redraw - without needing
+/// every individual call site to know about or wrap around a progress bar.
+struct ProgressAwareWriter {
+    multi: MultiProgress,
+}
+
+impl Write for ProgressAwareWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let multi = self.multi.clone();
+        multi.suspend(|| std::io::stderr().write(buf))
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::stderr().flush()
+    }
+}
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
 
+    let multi = MultiProgress::new();
+
     let log_level = if cli.verbose { "debug" } else { "info" };
+    let writer = ProgressAwareWriter { multi: multi.clone() };
+    // env_logger normally decides whether to emit ANSI color codes for its
+    // level tags ([INFO ]/[WARN ]/[ERROR]) by checking if it's writing
+    // directly to a real terminal. Routing through Target::Pipe means it's
+    // now writing to an arbitrary Write impl instead, so that
+    // auto-detection can't see through to the real stderr underneath and
+    // silently falls back to no color. We do the terminal check ourselves
+    // (against the real stderr, not our wrapper) and tell it explicitly.
+    let write_style = if std::io::stderr().is_terminal() {
+        env_logger::WriteStyle::Always
+    } else {
+        env_logger::WriteStyle::Never
+    };
     env_logger::Builder::new()
         .filter_level(log_level.parse().unwrap())
         .format_timestamp(None)
         .format_target(false)
+        .write_style(write_style)
+        .target(env_logger::Target::Pipe(Box::new(writer)))
         .init();
 
     print_banner();
@@ -165,9 +220,10 @@ Run with --install to download them.",
         // Multiple raw assemblies can share contig names (e.g. "TRINITY_DN5..."
         // appearing in more than one assembler's output), so keys must be
         // prefixed with the assembly file stem to stay unique.
-        score::score_assemblies(&assembly_files, &left, &right, cli.threads, cli.verbose, true)?
+        score::score_assemblies(&assembly_files, &left, &right, cli.threads, cli.verbose, true, &multi)?
     };
     info!("Scored {} contigs across all assemblies.", scores.len());
+
     if cli.score_only {
         let csv_path = score::write_scores_csv(&scores, &output)?;
         println!("\n{} Scores written to {:?}", "✓".green().bold(), csv_path);
@@ -178,7 +234,7 @@ Run with --install to download them.",
 
     // 4. Filter low-scoring contigs
     info!("{}", "Filtering contigs by score...".cyan());
-    let filtered = filter::filter_assemblies(&assembly_files, &scores, cli.min_score)?;
+    let filtered = filter::filter_assemblies(&assembly_files, &scores, cli.min_score, &multi)?;
     info!("Kept {}/{} assemblies after filtering.", filtered.len(), assembly_files.len());
     if filtered.is_empty() {
         bail!("All assemblies removed by score filter. Try lowering --min-score.");
@@ -196,12 +252,12 @@ Run with --install to download them.",
 
     // 7. Cluster with vsearch
     info!("{}", "Clustering with vsearch...".cyan());
-    let msa_path = cluster::cluster_vsearch(&cat_path, cli.id, cli.threads)?;
+    let msa_path = cluster::cluster_vsearch(&cat_path, cli.id, cli.threads, &multi)?;
     info!("vsearch MSA written to {:?}", msa_path);
 
     // 8. Score-guided consensus selection
     info!("{}", "Selecting best representative per cluster...".cyan());
-    let cons_path = consensus::build_consensus(&msa_path, &scores, &sequences, &output)?;
+    let cons_path = consensus::build_consensus(&msa_path, &scores, &sequences, &output, &multi)?;
     info!("Consensus FASTA written to {:?}", cons_path);
 
     // 9. Final scoring pass
@@ -219,8 +275,9 @@ Run with --install to download them.",
                 &PathBuf::from(right),
                 cli.threads, cli.verbose,
                 false,
+                &multi,
             )?;
-            filter::write_filtered_fasta(&cons_path, &final_scores, cli.min_score, &output)?
+            filter::write_filtered_fasta(&cons_path, &final_scores, cli.min_score, &output, &multi)?
         } else {
             std::fs::copy(&cons_path, &output)
                 .with_context(|| format!("Failed to copy {:?} to {:?}", cons_path, output))?;

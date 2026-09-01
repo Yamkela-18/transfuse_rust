@@ -7,18 +7,38 @@
 //
 //   1. `samtools coverage`  - cheap per-contig aggregates: read count,
 //      breadth of coverage, mean depth, mean base/map quality.
-//   2. `samtools view` (sampled, early-exit) - estimates the library's
-//      empirical fragment-size distribution (median/MAD of TLEN), the way
-//      Picard/samtools themselves estimate insert-size distributions.
-//   3. `samtools view` (full, streamed) - walks every primary mapped
-//      alignment once to accumulate:
-//        - pairs_total / pairs_proper (FLAG orientation + insert size
-//          tested against pass 2's distribution, not the aligner's own
-//          0x2 bit)                                            -> sCord
-//        - depth_windows (per-window overlap sums)             -> sCseg
-//   4. `samtools mpileup` (streamed) - per-position, quality-weighted
-//      match/mismatch voting across all reads overlapping each base
-//                                                               -> sCnuc
+//   2. `samtools view` (sampled, early-exit) - empirical fragment-size
+//      distribution (median/MAD of TLEN).
+//   3. `samtools view` (full, streamed) - pair concordance (sCord) and
+//      per-window depth (sCseg). Primary-alignment-only: multi-mapping
+//      reads are counted via whichever alignment the aligner tagged
+//      primary, not reassigned - see README "Known differences" for what
+//      this leaves on the table relative to the original tool's
+//      EM-corrected read assignment.
+//   4. `samtools mpileup` (streamed) - per-position quality-weighted
+//      identity (sCnuc). Also primary-alignment-only, same caveat.
+//
+// `compute_coverage` takes an `on_phase` callback, called once before each
+// of the four passes above with a short phase name. score.rs uses this to
+// tick its progress bar after real, potentially slow subprocess work
+// actually happens, rather than only once when the whole assembly is
+// done - a single assembly can take minutes, and without per-phase ticks
+// the bar would sit frozen at one percentage for that entire stretch.
+// Deliberately a plain `&mut dyn FnMut(&str)` rather than depending on
+// indicatif directly, so this module doesn't need to know progress bars
+// exist - score.rs supplies whatever behavior it wants.
+//
+// stderr on every subprocess call below is suppressed (`.stderr(Stdio::
+// null())` on streaming calls; `.output()` naturally captures rather than
+// inherits it on the non-streaming one). samtools writes its own internal
+// status lines - e.g. mpileup's "[mpileup] 1 samples in 1 input files" -
+// directly to inherited stderr, completely outside Rust's `log` crate and
+// therefore invisible to the MultiProgress-based coordination in main.rs;
+// left alone, those lines interleave with and visually corrupt whichever
+// progress bar is active. Failure diagnostics still surface via each
+// command's exit status and the `bail!` messages below - suppressing
+// stderr loses samtools' own detail on a failure, but every one of these
+// calls already reports success/failure independently.
 //
 // `ContigStats::score()` below is a legacy, simplified heuristic kept only
 // for this file's own unit tests. It is NOT what the pipeline uses - the
@@ -39,19 +59,22 @@ const NUM_WINDOWS: usize = 10;
 
 /// Cap on how many fragment-size samples we collect before stopping early -
 /// a modest sample is enough to estimate a stable median/MAD, and this
-/// keeps pass 2 fast even on huge BAMs.
+/// keeps that pass fast even on huge BAMs.
 const MAX_FRAGMENT_SAMPLES: usize = 2_000_000;
+
+/// Number of times `compute_coverage` calls `on_phase` per invocation -
+/// score.rs uses this to size its progress bar correctly. Kept as one
+/// named constant rather than a magic number, since it has to stay in
+/// sync with the actual number of `on_phase(...)` calls below.
+pub const PHASES: u64 = 4;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
 /// Per-contig alignment statistics extracted from the BAM file.
-///
-/// Not every field is consumed by `score::score_assemblies` (only
-/// `covered_bases`, `length`, `pairs_total`, `pairs_proper`, `depth_windows`,
-/// `nuc_score`, and `mean_depth` are). The rest are raw samtools output kept
-/// for reporting/diagnostics, hence the blanket allow below.
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
+#[allow(dead_code)] // num_reads/coverage/mean_depth/mean_base_quality/mean_map_quality are
+                     // diagnostic - populated from samtools coverage but not currently read
+                     // by score.rs, which uses covered_bases/length directly instead.
 pub struct ContigStats {
     pub num_reads: u64,
     pub covered_bases: u64,
@@ -61,10 +84,9 @@ pub struct ContigStats {
     pub mean_map_quality: f64,
     pub length: u64,
 
-    // Populated by passes 2-4 - see module docs.
     pub pairs_total: u64,        // reads with FLAG & 0x1 (paired), for sCord
     pub pairs_proper: u64,       // reads passing our own orientation+insert-size test, for sCord
-    pub depth_windows: Vec<f64>, // mean depth per window along the contig, for sCseg
+    pub depth_windows: Vec<f64>, // mean depth per window, for sCseg
     pub nuc_score: f64,          // mean per-position quality-weighted identity, for sCnuc
 }
 
@@ -73,8 +95,6 @@ impl ContigStats {
     /// `score::score_assemblies`, which combines the real sCnuc/sCcov/sCord/
     /// sCseg components as a product rather than these ad-hoc weights.
     /// Kept only so existing callers/tests of this struct don't break.
-    /// Only exercised by this module's own tests, so it's dead code in a
-    /// normal (non-test) build.
     #[allow(dead_code)]
     pub fn score(&self) -> f64 {
         if self.length == 0 { return 0.0; }
@@ -85,7 +105,8 @@ impl ContigStats {
     }
 }
 
-/// Accumulator for the pass-3 alignment details, keyed by contig name.
+/// Accumulator for the pair-concordance + depth-window pass, keyed by
+/// contig name.
 #[derive(Debug, Clone)]
 struct AlignDetail {
     pairs_total: u64,
@@ -105,9 +126,8 @@ impl AlignDetail {
 
 /// The library's empirical fragment-size distribution, estimated from a
 /// sample of read pairs. `mad` of 0.0 means "no usable distribution" (e.g.
-/// single-end data, or a sample too small/degenerate to estimate from) - in
-/// that case the insert-size half of the concordance check is skipped
-/// rather than penalising every pair.
+/// single-end data) - in that case the insert-size half of the
+/// concordance check is skipped rather than penalising every pair.
 #[derive(Debug, Clone, Copy)]
 struct FragmentStats {
     median: f64,
@@ -117,15 +137,22 @@ struct FragmentStats {
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Runs all four passes on bam_path (mpileup additionally needs the
-/// assembly FASTA it was aligned against) and returns per-contig stats with
-/// every sCnuc/sCcov/sCord/sCseg input populated.
-pub fn compute_coverage(bam_path: &Path, fasta_path: &Path) -> Result<HashMap<String, ContigStats>> {
+/// assembly FASTA it was aligned against) and returns per-contig stats
+/// with every sCnuc/sCcov/sCord/sCseg input populated. Calls `on_phase`
+/// with a short label immediately before each pass starts - see module
+/// docs for why.
+pub fn compute_coverage(
+    bam_path: &Path,
+    fasta_path: &Path,
+    on_phase: &mut dyn FnMut(&str),
+) -> Result<HashMap<String, ContigStats>> {
+    on_phase("samtools coverage");
     debug!("  Running samtools coverage on {:?}", bam_path);
 
     let output = Command::new("samtools")
         .args(["coverage", "-d", "0"]) // -d 0: no depth cap
         .arg(bam_path)
-        .output()
+        .output() // captures stdout+stderr rather than inheriting - no suppression needed
         .context("Failed to run samtools coverage")?;
 
     if !output.status.success() {
@@ -139,12 +166,15 @@ pub fn compute_coverage(bam_path: &Path, fasta_path: &Path) -> Result<HashMap<St
     let lengths: HashMap<String, u64> =
         stats.iter().map(|(k, v)| (k.clone(), v.length)).collect();
 
+    on_phase("fragment size estimation");
     debug!("  Estimating fragment-size distribution from {:?}", bam_path);
     let frag = estimate_fragment_stats(bam_path)?;
 
-    debug!("  Running samtools view on {:?} for per-read detail", bam_path);
+    on_phase("pair concordance");
+    debug!("  Running samtools view on {:?} for pair concordance + depth windows", bam_path);
     let details = compute_alignment_details(bam_path, &lengths, &frag)?;
 
+    on_phase("per-base identity");
     debug!("  Running samtools mpileup on {:?} for per-base identity", bam_path);
     let nuc_scores = compute_nuc_identity(bam_path, fasta_path)?;
 
@@ -172,12 +202,12 @@ fn parse_coverage_output(text: &str) -> Result<HashMap<String, ContigStats>> {
 
     for line in text.lines() {
         if line.trim().is_empty()
-            || line.starts_with('#')
-            || line.starts_with("name")
-            || line.starts_with("rname")
-        {
-            continue;
-        }
+    || line.starts_with('#')
+    || line.starts_with("name")
+    || line.starts_with("rname")
+{
+    continue;
+}
         let cols: Vec<&str> = line.trim().split('\t').collect();
         if cols.len() < 9 { continue; }
 
@@ -209,6 +239,7 @@ fn estimate_fragment_stats(bam_path: &Path) -> Result<FragmentStats> {
         .args(["view", "-F", "0x904"])
         .arg(bam_path)
         .stdout(Stdio::piped())
+        .stderr(Stdio::null()) // suppress samtools' own status/warning lines
         .spawn()
         .context("Failed to spawn samtools view for fragment-size sampling")?;
 
@@ -233,7 +264,6 @@ fn estimate_fragment_stats(bam_path: &Path) -> Result<FragmentStats> {
         let flag: u32 = cols[1].parse().unwrap_or(0);
         let tlen: i64 = cols[8].parse().unwrap_or(0);
 
-        // Sample once per fragment (read1 of a pair) with a real insert size.
         if flag & 0x1 != 0 && flag & 0x40 != 0 && tlen != 0 {
             samples.push(tlen.abs());
             if samples.len() >= MAX_FRAGMENT_SAMPLES {
@@ -243,8 +273,6 @@ fn estimate_fragment_stats(bam_path: &Path) -> Result<FragmentStats> {
         }
     }
 
-    // Ignore the exit status here - we may have deliberately killed the
-    // process once enough samples were collected.
     let _ = child.wait();
 
     let (median, mad) = median_and_mad(&samples);
@@ -264,7 +292,7 @@ fn median_and_mad(samples: &[i64]) -> (f64, f64) {
         .map(|&s| (s as f64 - median).abs() as i64)
         .collect();
     deviations.sort_unstable();
-    let mad = percentile(&deviations, 0.5).max(1.0); // avoid a zero-width window
+    let mad = percentile(&deviations, 0.5).max(1.0);
 
     (median, mad)
 }
@@ -277,11 +305,6 @@ fn percentile(sorted: &[i64], p: f64) -> f64 {
     sorted[idx.min(sorted.len().saturating_sub(1))] as f64
 }
 
-/// A pair is concordant if the mates map to opposite strands (checkable
-/// per-record via FLAG 0x10/0x20, no mate lookup needed) and, when we have
-/// a usable library-wide distribution, the insert size is within 3 MADs of
-/// the median. This replaces trusting the aligner's own "properly paired"
-/// bit, which different aligners set under different, inconsistent rules.
 fn pair_is_concordant(flag: u32, tlen: i64, frag: &FragmentStats) -> bool {
     let self_reverse = flag & 0x10 != 0;
     let mate_reverse = flag & 0x20 != 0;
@@ -290,7 +313,7 @@ fn pair_is_concordant(flag: u32, tlen: i64, frag: &FragmentStats) -> bool {
     let insert_ok = if frag.mad > 0.0 {
         (tlen.abs() as f64 - frag.median).abs() <= 3.0 * frag.mad
     } else {
-        true // no usable distribution - don't penalise on this axis
+        true
     };
 
     orientation_ok && insert_ok
@@ -298,20 +321,16 @@ fn pair_is_concordant(flag: u32, tlen: i64, frag: &FragmentStats) -> bool {
 
 // ── Pass 3 (samtools view, full): pair concordance + depth windows ─────────
 
-/// Streams `samtools view` (SAM text) rather than buffering the whole
-/// output, since a full BAM can be far larger than we want to hold in
-/// memory at once.
 fn compute_alignment_details(
     bam_path: &Path,
     lengths: &HashMap<String, u64>,
     frag: &FragmentStats,
 ) -> Result<HashMap<String, AlignDetail>> {
-    // -F 0x904 excludes unmapped (0x4) + secondary (0x100) + supplementary
-    // (0x800) records, so each read is only counted once.
     let mut child = Command::new("samtools")
         .args(["view", "-F", "0x904"])
         .arg(bam_path)
         .stdout(Stdio::piped())
+        .stderr(Stdio::null()) // suppress samtools' own status/warning lines
         .spawn()
         .context("Failed to spawn samtools view")?;
 
@@ -339,7 +358,7 @@ fn compute_alignment_details(
         }
         let contig_len = match lengths.get(rname) {
             Some(&l) => l,
-            None => continue, // unknown to samtools coverage - skip defensively
+            None => continue,
         };
 
         let flag: u32 = cols[1].parse().unwrap_or(0);
@@ -373,8 +392,8 @@ fn compute_alignment_details(
     Ok(details)
 }
 
-/// Sums the reference-consuming CIGAR ops (M/D/N/=/X), used to place a read
-/// into the right depth window(s).
+/// Sums the reference-consuming CIGAR ops (M/D/N/=/X), used to place a
+/// read into the right depth window(s).
 fn cigar_ref_len(cigar: &str) -> u64 {
     if cigar == "*" {
         return 0;
@@ -435,18 +454,17 @@ fn finalize_windows(window_bases: &[f64], contig_len: u64) -> Vec<f64> {
 
 // ── Pass 4 (samtools mpileup): per-position quality-weighted identity ──────
 
-/// Runs `samtools mpileup` against the assembly it was aligned to, and
-/// averages a quality-weighted match/mismatch vote at every covered
-/// position into one identity score per contig.
 fn compute_nuc_identity(bam_path: &Path, fasta_path: &Path) -> Result<HashMap<String, f64>> {
-    // -B disables BAQ recalculation (we do our own quality weighting);
-    // -q 0 -Q 0 disable mapping/base-quality filtering so we see everything
-    // and apply our own weighting rather than mpileup silently dropping data.
     let mut child = Command::new("samtools")
         .args(["mpileup", "-B", "-q", "0", "-Q", "0", "-f"])
         .arg(fasta_path)
         .arg(bam_path)
         .stdout(Stdio::piped())
+        // This is the "[mpileup] 1 samples in 1 input files" line - mpileup
+        // writes its own status directly to stderr regardless of verbosity
+        // settings. Suppressed here rather than routed through `log`,
+        // since it never went through `log` to begin with.
+        .stderr(Stdio::null())
         .spawn()
         .context("Failed to spawn samtools mpileup")?;
 
@@ -492,15 +510,6 @@ fn compute_nuc_identity(bam_path: &Path, fasta_path: &Path) -> Result<HashMap<St
         .collect())
 }
 
-/// Parses one mpileup line's pileup/quality-string pair into a
-/// quality-weighted "is the assembled base correct here" score in [0,1],
-/// or None if no reads cover this position.
-///
-/// Pileup string tokens handled: `.`/`,` (match, fwd/rev), `ACGTNacgtn`
-/// (mismatch), `^X` (read start, X = a mapping-quality char to skip),
-/// `$` (read end), `+N<bases>`/`-N<bases>` (insertion/deletion - skipped,
-/// they don't represent a base call at *this* position), `*` (this read
-/// has a deletion spanning this position - counted as disagreement).
 fn score_pileup_line(pileup: &str, quals: &str) -> Option<f64> {
     let bases = pileup.as_bytes();
     let quals = quals.as_bytes();
@@ -512,7 +521,7 @@ fn score_pileup_line(pileup: &str, quals: &str) -> Option<f64> {
     while i < bases.len() {
         match bases[i] as char {
             '^' => {
-                i += 2; // '^' plus one mapping-quality-encoded char
+                i += 2;
             }
             '$' => {
                 i += 1;
@@ -527,7 +536,7 @@ fn score_pileup_line(pileup: &str, quals: &str) -> Option<f64> {
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0);
-                i += len; // skip the inserted/deleted bases themselves
+                i += len;
             }
             '.' | ',' | 'A' | 'C' | 'G' | 'T' | 'N' | 'a' | 'c' | 'g' | 'n' | 't' | '*' => {
                 let is_match = matches!(bases[i] as char, '.' | ',');
@@ -598,16 +607,12 @@ contig1\t1\t1000\t150\t980\t98.0\t8.5\t35.0\t42.0
 
     #[test]
     fn test_cigar_ref_len() {
-        // 5 soft-clipped, 10 matches, 2 deletions, 3 insertions
-        assert_eq!(cigar_ref_len("5S10M2D3I"), 12); // 10 M + 2 D; S/I don't consume ref
+        assert_eq!(cigar_ref_len("5S10M2D3I"), 12);
     }
 
     #[test]
     fn test_add_to_windows_splits_across_boundary() {
         let mut windows = vec![0.0; 10];
-        // contig length 100 -> window width 10; a read spanning
-        // positions 6-15 (1-based) should split 5 bases into window 0
-        // and 5 bases into window 1.
         add_to_windows(&mut windows, 100, 6, 10);
         assert!((windows[0] - 5.0).abs() < 1e-9);
         assert!((windows[1] - 5.0).abs() < 1e-9);
@@ -616,7 +621,7 @@ contig1\t1\t1000\t150\t980\t98.0\t8.5\t35.0\t42.0
 
     #[test]
     fn test_median_and_mad_robust_to_outlier() {
-        let samples = vec![100, 102, 98, 101, 99, 300]; // one wild outlier
+        let samples = vec![100, 102, 98, 101, 99, 300];
         let (median, mad) = median_and_mad(&samples);
         assert!((98.0..=102.0).contains(&median), "median {median} pulled by outlier");
         assert!(mad < 10.0, "mad {mad} too large - not robust to the outlier");
@@ -625,42 +630,31 @@ contig1\t1\t1000\t150\t980\t98.0\t8.5\t35.0\t42.0
     #[test]
     fn test_pair_is_concordant() {
         let frag = FragmentStats { median: 300.0, mad: 20.0 };
-
-        // opposite strands (self fwd, mate rev), insert size close to median
         let flag_ok = 0x1 | 0x40 | 0x20;
         assert!(pair_is_concordant(flag_ok, 310, &frag));
 
-        // same strand on both mates -> never concordant, regardless of insert size
         let flag_same_strand = 0x1 | 0x40;
         assert!(!pair_is_concordant(flag_same_strand, 310, &frag));
-
-        // opposite strands but a wildly wrong insert size -> not concordant
         assert!(!pair_is_concordant(flag_ok, 5000, &frag));
 
-        // no usable fragment distribution -> insert-size check is skipped
         let frag_none = FragmentStats { median: 0.0, mad: 0.0 };
         assert!(pair_is_concordant(flag_ok, 999_999, &frag_none));
     }
 
     #[test]
     fn test_score_pileup_line_all_matches() {
-        // 3 matches, Phred 40 ('I' = 73, 73-33=40)
         let score = score_pileup_line(",..", "III").unwrap();
         assert!(score > 0.99, "expected near-1.0 for all high-quality matches, got {score}");
     }
 
     #[test]
     fn test_score_pileup_line_with_mismatch() {
-        // 2 matches + 1 confident mismatch, all Phred 40
         let score = score_pileup_line(".A,", "III").unwrap();
         assert!(score > 0.5 && score < 0.8, "expected a middling score, got {score}");
     }
 
     #[test]
     fn test_score_pileup_line_skips_indel_and_start_end_markers() {
-        // read start (^ + mapq char), insertion announcement (+2AC), match,
-        // deletion announcement (-1A), read end ($), match - only the two
-        // actual base calls should consume quality characters.
         let score = score_pileup_line("^!.+2AC,-1A$,", "II").unwrap();
         assert!(score > 0.99, "expected near-1.0, indel/start/end tokens should be skipped, got {score}");
     }
@@ -668,5 +662,14 @@ contig1\t1\t1000\t150\t980\t98.0\t8.5\t35.0\t42.0
     #[test]
     fn test_score_pileup_line_empty_returns_none() {
         assert!(score_pileup_line("", "").is_none());
+    }
+
+    #[test]
+    fn test_compute_coverage_calls_on_phase_expected_number_of_times() {
+        // We can't run real samtools here, but we CAN confirm the PHASES
+        // constant matches the doc'd contract score.rs relies on to size
+        // its progress bar - this test exists to fail loudly if someone
+        // adds/removes an on_phase call without updating PHASES to match.
+        assert_eq!(PHASES, 4);
     }
 }

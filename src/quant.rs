@@ -24,7 +24,7 @@ use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 /// Number of FASTQ records sampled to estimate a single representative read
@@ -43,6 +43,7 @@ fn open_fastq(path: &Path) -> Result<Box<dyn BufRead>> {
             .arg("-c")
             .arg(format!("gunzip -c {:?}", path))
             .stdout(Stdio::piped())
+            .stderr(Stdio::null())
             .spawn()
             .context("Failed to spawn gunzip")?;
         let stdout = child
@@ -99,13 +100,13 @@ pub fn estimate_read_length(left: &Path) -> Result<u64> {
 }
 
 /// Runs `samtools sort -n` to produce a name-grouped copy of the BAM for
-/// salmon's alignment mode. Salmon 2.0's own CLI reference is explicit that
+/// salmon's alignment mode. Salmon's own CLI reference is explicit that
 /// `-a/--alignments` needs "a name-grouped BAM of reads aligned to the
 /// transcriptome" (mates adjacent), whereas bam.rs's samtools coverage/
 /// mpileup passes want coordinate-sorted for positional access - the two
-/// requirements conflict, so we sort a separate throwaway copy here rather
-/// than changing the BAM the rest of the pipeline depends on.
-fn name_sort_for_salmon(bam_path: &Path, threads: usize) -> Result<PathBuf> {
+/// requirements conflict, so a separate throwaway copy is sorted here
+/// rather than changing the BAM the rest of the pipeline depends on.
+fn name_sort_for_salmon(bam_path: &Path, threads: usize) -> Result<std::path::PathBuf> {
     let out_path = bam_path.with_extension("namesorted.bam");
 
     let status = Command::new("samtools")
@@ -116,6 +117,7 @@ fn name_sort_for_salmon(bam_path: &Path, threads: usize) -> Result<PathBuf> {
         .arg("-o")
         .arg(&out_path)
         .arg(bam_path)
+        .stderr(Stdio::null()) // suppress samtools' own status lines
         .status()
         .context("Failed to run samtools sort -n for salmon input")?;
 
@@ -131,6 +133,16 @@ fn name_sort_for_salmon(bam_path: &Path, threads: usize) -> Result<PathBuf> {
 /// content is identical, just re-ordered - not a second independent
 /// alignment pass), then parses quant.sf for (EffectiveLength, NumReads)
 /// per contig.
+///
+/// Uses `.output()` rather than `.status()`: Salmon writes its own verbose
+/// progress/timing log directly to stderr regardless of verbosity flags
+/// (the "INFO salmon::timing: phase complete ..." lines), which - since it
+/// never goes through Rust's `log` crate - is invisible to the
+/// MultiProgress-based coordination in main.rs and, left inherited, visibly
+/// corrupts whichever progress bar is active. `.output()` captures it
+/// instead of inheriting it; it's discarded on success and surfaced in the
+/// error message if salmon actually fails, so nothing is lost for
+/// debugging, just hidden on the happy path.
 pub fn run_salmon_quant(
     bam_path: &Path,
     fasta_path: &Path,
@@ -143,7 +155,7 @@ pub fn run_salmon_quant(
         let _ = fs::remove_dir_all(&out_dir);
     }
 
-    let status = Command::new("salmon")
+    let output = Command::new("salmon")
         .args(["quant", "--libType", "A", "--no-version-check"])
         .arg("--alignments")
         .arg(&name_sorted)
@@ -153,15 +165,16 @@ pub fn run_salmon_quant(
         .arg(threads.to_string())
         .arg("--output")
         .arg(&out_dir)
-        .status()
+        .output()
         .context("Failed to run salmon quant")?;
 
     // The name-sorted copy is only ever needed for this one call - clean it
     // up regardless of whether salmon succeeded.
     let _ = fs::remove_file(&name_sorted);
 
-    if !status.success() {
-        bail!("salmon quant exited with a non-zero status");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("salmon quant exited with a non-zero status: {}", stderr);
     }
 
     let quant_sf = out_dir.join("quant.sf");
